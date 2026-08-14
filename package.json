@@ -4,12 +4,9 @@
   "description": "GPU-aware execution layer for DeepSeek Harness: gpu_status / gpu_exec / gpu_run_bg tools, per-step GPU context injection, automatic CUDA_VISIBLE_DEVICES card selection",
   "type": "module",
   "main": "./lib/index.js",
-  "types": "./lib/index.d.ts",
+  "types": "./lib/index-B0iRTC5F.d.ts",
   "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
-    },
+    ".": "./lib/index.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -17,7 +14,7 @@
     "lib/types/**/*.d.ts"
   ],
   "scripts": {
-    "build": "tsdown",
+    "build": "tsdown && mv lib/index-*.d.ts lib/index.d.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
