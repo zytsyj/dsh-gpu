@@ -27,15 +27,11 @@ export interface GpuDevice {
 /** Whole-host snapshot. */
 export interface GpuSnapshot {
   devices: GpuDevice[]
-  /** nvidia-smi string when present, e.g. '550.54.15'. */
-  driverVersion?: string
-  /** CUDA version string when present, e.g. '12.4'. */
-  cudaVersion?: string
   /** Wall-clock time of the snapshot. */
   sampledAt: number
 }
 
-/** Device considered busy above either threshold. */
+/** Device considered busy at or above either threshold. */
 const BUSY_MEMORY_PCT = 80
 const BUSY_UTIL_PCT = 50
 
@@ -103,9 +99,13 @@ export function parseLeadingInt(value: string): number {
 }
 
 /** One-line human summary for prompt injection. */
-export function summarize(snapshot: GpuSnapshot): string {
+export function summarize(
+  snapshot: GpuSnapshot,
+  memoryPct = BUSY_MEMORY_PCT,
+  utilPct = BUSY_UTIL_PCT,
+): string {
   if (snapshot.devices.length === 0) return 'No NVIDIA GPUs detected.'
-  const free = snapshot.devices.filter(d => isFree(d))
+  const free = snapshot.devices.filter(d => isFree(d, memoryPct, utilPct))
   const parts = snapshot.devices.map(d =>
     `GPU${d.index} ${d.name}: ${d.memoryUsedMiB}/${d.memoryTotalMiB}MiB ${d.utilizationPct}%util`
       + (d.temperatureC > 0 ? ` ${d.temperatureC}C` : ''),

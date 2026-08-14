@@ -1,6 +1,6 @@
 {
   "name": "dsh-gpu",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "GPU-aware execution layer for DeepSeek Harness: gpu_status / gpu_exec / gpu_run_bg tools, per-step GPU context injection, automatic CUDA_VISIBLE_DEVICES card selection",
   "type": "module",
   "main": "./lib/index.js",
@@ -16,15 +16,31 @@
     "lib",
     "cordis.patch.yml"
   ],
+  "sideEffects": false,
+  "engines": {
+    "node": "^22.19.0 || >=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zytsyj/dsh-gpu.git"
+  },
+  "homepage": "https://github.com/zytsyj/dsh-gpu#readme",
+  "bugs": {
+    "url": "https://github.com/zytsyj/dsh-gpu/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
   },
   "scripts": {
-    "build": "tsdown && mv lib/index-*.d.ts lib/index.d.ts",
+    "build": "tsdown",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:package": "publint && attw --pack . --profile esm-only",
+    "verify": "npm run typecheck && npm test && npm run build && npm run check:package",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build && publint"
   },
   "keywords": [
     "deepseek-harness",
@@ -36,12 +52,16 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/cordis": ">=4.0.1",
-    "@deepseek-ai/dsh-agent": ">=0.1.0-rc.5",
-    "@deepseek-ai/dsh-jobs": ">=0.1.0-rc.5",
-    "@deepseek-ai/dsh-llm": ">=0.1.0-rc.5",
-    "@deepseek-ai/dsh-shell": ">=0.1.0-rc.5",
-    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.5"
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-agent": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-jobs": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-shell": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "^0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
@@ -49,9 +69,12 @@
     "@deepseek-ai/dsh-jobs": "0.1.0-rc.6",
     "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
     "@deepseek-ai/dsh-shell": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.6",
     "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
-    "@deepseek-ai/schemastery": "^3.18.1",
-    "tsdown": "^0.12.6",
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^22.20.1",
+    "publint": "^0.3.23",
+    "tsdown": "^0.22.14",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
   },

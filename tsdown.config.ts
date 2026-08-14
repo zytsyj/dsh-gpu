@@ -6,6 +6,7 @@ export default defineConfig({
   dts: true,
   format: 'esm',
   target: 'node22',
+  fixedExtension: false,
   exports: false,
-  unbundle: false,
+  unbundle: true,
 })

@@ -18,11 +18,13 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { isAbsolute, resolve as resolvePath } from 'node:path'
+import { defineTool, TOOL_ABORTED, type ToolRunContext } from '@deepseek-ai/dsh-tools'
+import { createUserMessage, HarnessError } from '@deepseek-ai/dsh-llm'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { ShellProcess } from '@deepseek-ai/dsh-shell'
 import type {} from '@deepseek-ai/dsh-jobs'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import { QUERY_COMMAND, parseQueryCsv, summarize, isFree, freenessScore } from './nvidia.ts'
 import type { GpuSnapshot } from './nvidia.ts'
 
@@ -45,18 +47,20 @@ export interface Config {
   refreshIntervalMs?: number
   /** Query timeout for nvidia-smi, ms. Default 10_000. */
   queryTimeoutMs?: number
-  /** Consider a GPU busy above this memory-used percent. Default 80. */
+  /** Consider a GPU busy at or above this memory-used percent. Default 80. */
   busyMemoryPct?: number
-  /** Consider a GPU busy above this SM utilization percent. Default 50. */
+  /** Consider a GPU busy at or above this SM utilization percent. Default 50. */
   busyUtilPct?: number
 }
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
 export const Config: z<Config> = z.object({
   stepContext: z.boolean().default(true),
-  refreshIntervalMs: z.number().default(60_000),
-  queryTimeoutMs: z.number().default(10_000),
-  busyMemoryPct: z.number().default(80),
-  busyUtilPct: z.number().default(50),
+  refreshIntervalMs: z.number().step(1).min(0).max(MAX_TIMER_DELAY_MS).default(60_000),
+  queryTimeoutMs: z.number().step(1).min(1).max(MAX_TIMER_DELAY_MS).default(10_000),
+  busyMemoryPct: z.number().min(0).max(100).default(80),
+  busyUtilPct: z.number().min(0).max(100).default(50),
 })
 
 /** Args for gpu_exec. */
@@ -78,9 +82,70 @@ interface BgArgs {
   workdir?: string
 }
 
+function abortToolCall(): never {
+  const error = new HarnessError('tool call aborted', TOOL_ABORTED)
+  error.name = 'AbortError'
+  throw error
+}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) abortToolCall()
+}
+
+function validateConfig(config: Config): void {
+  const validateTimer = (key: 'refreshIntervalMs' | 'queryTimeoutMs', value: number | undefined, min: number): void => {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < min || value > MAX_TIMER_DELAY_MS)) {
+      throw new TypeError(`dsh-gpu: ${key} must be an integer from ${min} to ${MAX_TIMER_DELAY_MS}`)
+    }
+  }
+  const validatePct = (key: 'busyMemoryPct' | 'busyUtilPct', value: number | undefined): void => {
+    if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 100)) {
+      throw new TypeError(`dsh-gpu: ${key} must be a number from 0 to 100`)
+    }
+  }
+  validateTimer('refreshIntervalMs', config.refreshIntervalMs, 0)
+  validateTimer('queryTimeoutMs', config.queryTimeoutMs, 1)
+  validatePct('busyMemoryPct', config.busyMemoryPct)
+  validatePct('busyUtilPct', config.busyUtilPct)
+}
+
+function validateCommandArgs(args: ExecArgs | BgArgs): void {
+  if (args.command.trim().length === 0) {
+    throw new Error('invalid command: expected a non-empty string')
+  }
+  if (args.description.trim().length === 0) {
+    throw new Error('invalid description: expected a non-empty string')
+  }
+  if (args.gpuIndex !== undefined && args.count !== undefined) {
+    throw new Error('gpuIndex and count are mutually exclusive')
+  }
+  if (args.gpuIndex !== undefined && (!Number.isSafeInteger(args.gpuIndex) || args.gpuIndex < 0)) {
+    throw new Error(`invalid gpuIndex: expected a non-negative integer, got ${String(args.gpuIndex)}`)
+  }
+  if (args.count !== undefined && (!Number.isSafeInteger(args.count) || args.count < 1)) {
+    throw new Error(`invalid count: expected a positive integer, got ${String(args.count)}`)
+  }
+  if ('timeoutMs' in args && args.timeoutMs !== undefined
+    && (!Number.isSafeInteger(args.timeoutMs) || args.timeoutMs < 1 || args.timeoutMs > MAX_TIMER_DELAY_MS)) {
+    throw new Error(`invalid timeoutMs: expected an integer from 1 to ${MAX_TIMER_DELAY_MS}`)
+  }
+}
+
 /** Sample the GPU host once through the mounted shell executor. */
-async function sampleGpus(ctx: Context, timeoutMs: number): Promise<GpuSnapshot | undefined> {
-  const result = await ctx.shell.run(ctx.shell.resolve({ command: QUERY_COMMAND, timeoutMs }))
+async function sampleGpus(
+  ctx: Context,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<GpuSnapshot | undefined> {
+  if (signal !== undefined) throwIfAborted(signal)
+  let result
+  try {
+    result = await ctx.shell.run(ctx.shell.resolve({ command: QUERY_COMMAND, timeoutMs, signal }))
+  } catch (error: unknown) {
+    if (signal?.aborted === true) abortToolCall()
+    throw error
+  }
+  if (result.aborted) abortToolCall()
   if (result.exitCode !== 0) return undefined
   const csv = [result.stdout.text, result.stderr.text].find(t => t.includes('index')) ?? result.stdout.text
   const snapshot = parseQueryCsv(csv)
@@ -94,7 +159,13 @@ export function pickGpus(
   busyMemoryPct: number,
   busyUtilPct: number,
 ): { indices: number[]; note: string } {
+  if (args.gpuIndex !== undefined && args.count !== undefined) {
+    throw new Error('gpuIndex and count are mutually exclusive')
+  }
   if (args.gpuIndex !== undefined) {
+    if (!Number.isSafeInteger(args.gpuIndex) || args.gpuIndex < 0) {
+      throw new Error(`gpuIndex must be a non-negative integer, got ${String(args.gpuIndex)}`)
+    }
     const device = snapshot.devices.find(d => d.index === args.gpuIndex)
     if (device === undefined) {
       throw new Error(`GPU ${args.gpuIndex} not found (host has ${snapshot.devices.length})`)
@@ -102,7 +173,7 @@ export function pickGpus(
     return { indices: [args.gpuIndex], note: `GPU ${args.gpuIndex} (pinned)` }
   }
   const count = args.count ?? 1
-  if (count < 1) throw new Error('count must be >= 1')
+  if (!Number.isSafeInteger(count) || count < 1) throw new Error('count must be a positive integer')
   if (count > snapshot.devices.length) {
     throw new Error(`requested ${count} GPUs, host has ${snapshot.devices.length}`)
   }
@@ -119,9 +190,11 @@ export function pickGpus(
   return { indices: chosen, note: `GPU ${chosen.join(',')} (auto: freest ${count})` }
 }
 
-/** `CUDA_VISIBLE_DEVICES=...` prefix for a selected set of GPUs. */
-function cudaPrefix(indices: number[]): string {
-  return `CUDA_VISIBLE_DEVICES=${indices.join(',')}`
+/** Resolve a model workdir relative to the invoking agent's session workspace. */
+function commandWorkdir(workdir: string | undefined, exec: ToolRunContext): string | undefined {
+  const sessionCwd = exec.agent?.session.header.cwd
+  if (workdir === undefined || isAbsolute(workdir) || sessionCwd === undefined) return workdir ?? sessionCwd
+  return resolvePath(sessionCwd, workdir)
 }
 
 /** JobOutcome from a settled shell process. */
@@ -134,6 +207,7 @@ function processOutcome(proc: ShellProcess): { status: 'completed' | 'killed' | 
 }
 
 export function apply(ctx: Context, config: Config = {}): void {
+  validateConfig(config)
   const stepContext = config.stepContext ?? true
   const refreshIntervalMs = config.refreshIntervalMs ?? 60_000
   const queryTimeoutMs = config.queryTimeoutMs ?? 10_000
@@ -144,11 +218,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   let cachedSnapshot: GpuSnapshot | undefined
   let cachedAt = 0
   let failedAt = 0
-  const sampleForInjection = async (): Promise<GpuSnapshot | undefined> => {
+  const sampleForInjection = async (signal: AbortSignal): Promise<GpuSnapshot | undefined> => {
     const now = Date.now()
     if (now - cachedAt < refreshIntervalMs) return cachedSnapshot
     if (now - failedAt < refreshIntervalMs) return undefined
-    const snapshot = await sampleGpus(ctx, queryTimeoutMs)
+    const snapshot = await sampleGpus(ctx, queryTimeoutMs, signal)
     if (snapshot !== undefined) {
       cachedSnapshot = snapshot
       cachedAt = now
@@ -162,7 +236,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     name: 'tool:gpu',
     order: 106,
     text: 'GPU tools: call gpu_status before GPU work; gpu_exec/gpu_run_bg select the freest card automatically '
-      + '(CUDA_VISIBLE_DEVICES is set for you); pass gpuIndex to pin a card explicitly.',
+      + '(CUDA_VISIBLE_DEVICES is set in the command environment); pass gpuIndex to pin a card explicitly.',
   })
 
   // ---- gpu_status ----
@@ -171,8 +245,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     description: 'Query the GPU host: every device, memory used/total, SM utilization, temperature, '
       + 'and which devices are currently free. Call this before any GPU work.',
     parameters: {},
-    async execute() {
-      const snapshot = await sampleGpus(ctx, queryTimeoutMs)
+    async execute(_args, exec) {
+      const snapshot = await sampleGpus(ctx, queryTimeoutMs, exec.signal)
       if (snapshot === undefined) {
         return {
           kind: 'no-gpu' as const,
@@ -190,8 +264,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       }))
       return {
         kind: 'status' as const,
-        driverVersion: snapshot.driverVersion ?? '',
-        cudaVersion: snapshot.cudaVersion ?? '',
         devices,
         freeIndices: devices.filter(d => d.free).map(d => d.index),
       }
@@ -212,8 +284,6 @@ export function apply(ctx: Context, config: Config = {}): void {
             additionalProperties: false,
             properties: {
               kind: { type: 'string', required: true, const: 'status' },
-              driverVersion: { type: 'string' },
-              cudaVersion: { type: 'string' },
               devices: {
                 type: 'array',
                 required: true,
@@ -252,29 +322,40 @@ export function apply(ctx: Context, config: Config = {}): void {
   ctx.tools.register(defineTool({
     name: 'gpu_exec',
     description: 'Run a one-shot command on the GPU host with automatic card selection: '
-      + 'CUDA_VISIBLE_DEVICES is set to the freest GPU (or the pinned gpuIndex), then the command runs '
+      + 'CUDA_VISIBLE_DEVICES is set in the environment to the freest GPU (or the pinned gpuIndex), then the command runs '
       + 'through the session shell executor. Use for short GPU commands (probes, quick python, builds); '
       + 'for long training/inference runs use gpu_run_bg.',
     parameters: {
       command: { type: 'string', required: true, description: 'The command to execute.' },
       description: { type: 'string', required: true, description: 'What this command does, 5-10 words.' },
-      gpuIndex: { type: 'number', description: 'Pin one explicit GPU index instead of auto-selection.' },
-      count: { type: 'number', description: 'Number of GPUs to reserve when auto-selecting (default 1).' },
+      gpuIndex: { type: 'integer', description: 'Pin one explicit GPU index instead of auto-selection.' },
+      count: { type: 'integer', description: 'Number of GPUs to select when auto-selecting (default 1).' },
       workdir: { type: 'string', description: 'Working directory (session workspace default).' },
-      timeoutMs: { type: 'number', description: 'Timeout in milliseconds.' },
+      timeoutMs: { type: 'integer', description: 'Timeout in milliseconds.' },
     },
     async execute(args: ExecArgs, exec) {
-      const snapshot = await sampleGpus(ctx, queryTimeoutMs)
+      validateCommandArgs(args)
+      const snapshot = await sampleGpus(ctx, queryTimeoutMs, exec.signal)
       if (snapshot === undefined) {
         throw new Error('nvidia-smi unavailable on the execution host — cannot select a GPU')
       }
       const { indices, note } = pickGpus(snapshot, args, busyMemoryPct, busyUtilPct)
-      const result = await ctx.shell.run(ctx.shell.resolve({
-        command: `${cudaPrefix(indices)} ${args.command}`,
-        ...args.workdir !== undefined ? { workdir: args.workdir } : {},
-        ...args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {},
-        signal: exec.signal,
-      }))
+      const workdir = commandWorkdir(args.workdir, exec)
+      throwIfAborted(exec.signal)
+      let result
+      try {
+        result = await ctx.shell.run(ctx.shell.resolve({
+          command: args.command,
+          env: { CUDA_VISIBLE_DEVICES: indices.join(',') },
+          ...workdir !== undefined ? { workdir } : {},
+          ...args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {},
+          signal: exec.signal,
+        }))
+      } catch (error: unknown) {
+        if (exec.signal.aborted) abortToolCall()
+        throw error
+      }
+      if (result.aborted) abortToolCall()
       return {
         kind: 'exec' as const,
         gpus: indices.join(','),
@@ -315,29 +396,32 @@ export function apply(ctx: Context, config: Config = {}): void {
     parameters: {
       command: { type: 'string', required: true, description: 'The long-running command to start.' },
       description: { type: 'string', required: true, description: 'What this job does, 5-10 words.' },
-      gpuIndex: { type: 'number', description: 'Pin one explicit GPU index instead of auto-selection.' },
-      count: { type: 'number', description: 'Number of GPUs to reserve (default 1).' },
+      gpuIndex: { type: 'integer', description: 'Pin one explicit GPU index instead of auto-selection.' },
+      count: { type: 'integer', description: 'Number of GPUs to select (default 1).' },
       workdir: { type: 'string', description: 'Working directory.' },
     },
     async execute(args: BgArgs, exec) {
+      validateCommandArgs(args)
       const jobs = ctx.get('jobs')
       if (jobs === undefined) {
         throw new Error('background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs')
       }
-      const snapshot = await sampleGpus(ctx, queryTimeoutMs)
+      const snapshot = await sampleGpus(ctx, queryTimeoutMs, exec.signal)
       if (snapshot === undefined) {
         throw new Error('nvidia-smi unavailable on the execution host — cannot select a GPU')
       }
       const { indices, note } = pickGpus(snapshot, args, busyMemoryPct, busyUtilPct)
-      if (exec.signal.aborted) return { kind: 'background' as const, jobId: '', gpus: indices.join(','), selection: note }
+      const workdir = commandWorkdir(args.workdir, exec)
+      throwIfAborted(exec.signal)
       const id = jobs.start({
         kind: 'gpu',
         label: `${note}: ${args.command}`,
         ...exec.agent !== undefined ? { owner: exec.agent } : {},
         run: () => {
           const proc = ctx.shell.start(ctx.shell.resolve({
-            command: `${cudaPrefix(indices)} ${args.command}`,
-            ...args.workdir !== undefined ? { workdir: args.workdir } : {},
+            command: args.command,
+            env: { CUDA_VISIBLE_DEVICES: indices.join(',') },
+            ...workdir !== undefined ? { workdir } : {},
           }))
           return {
             cancel: () => void proc.kill(),
@@ -373,12 +457,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (decision.kind === 'reject' || signal.aborted) return decision
       let snapshot: GpuSnapshot | undefined
       try {
-        snapshot = await sampleForInjection()
+        snapshot = await sampleForInjection(signal)
       } catch {
         return decision
       }
-      if (snapshot === undefined) return decision
-      const text = `GPU status: ${summarize(snapshot)}`
+      if (snapshot === undefined || signal.aborted) return decision
+      const text = `GPU status: ${summarize(snapshot, busyMemoryPct, busyUtilPct)}`
       return {
         kind: 'enter',
         messages: [

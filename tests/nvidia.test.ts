@@ -100,6 +100,11 @@ describe('pickGpus', () => {
   it('throws on unknown gpuIndex', () => {
     expect(() => pickGpus (snapshot, { gpuIndex: 42 }, 80, 50)).toThrow(/not found/)
   })
+
+  it('rejects fractional counts and conflicting selection modes', () => {
+    expect(() => pickGpus(snapshot, { count: 1.5 }, 80, 50)).toThrow(/positive integer/)
+    expect(() => pickGpus(snapshot, { gpuIndex: 1, count: 2 }, 80, 50)).toThrow(/mutually exclusive/)
+  })
 })
 
 describe('parseMiB', () => {
@@ -119,6 +124,13 @@ describe('summarize', () => {
     const text = summarize(parseQueryCsv(V100_CSV))
     expect(text).toContain('8 GPU(s): 7 free')
     expect(text).toContain('13928/32768MiB')
+  })
+
+  it('uses configured thresholds for its free count', () => {
+    const snapshot = parseQueryCsv(`index, name, memory.total [MiB], memory.used [MiB], utilization.gpu [%], temperature.gpu
+0, Test GPU, 1000 MiB, 100 MiB, 60 %, 40`)
+    expect(summarize(snapshot, 80, 50)).toContain('0 free')
+    expect(summarize(snapshot, 80, 70)).toContain('1 free')
   })
 })
 
