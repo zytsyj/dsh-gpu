@@ -1,0 +1,5 @@
+# The dsh-gpu bundle patch: adds this plugin to any profile it is installed in.
+# Addressable by id `gpu` from the profile's own cordis.patch.yml (last write wins).
+- insert:
+    - id: gpu
+      name: dsh-gpu
