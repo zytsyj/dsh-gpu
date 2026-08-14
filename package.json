@@ -1,6 +1,6 @@
 {
   "name": "dsh-gpu",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "GPU-aware execution layer for DeepSeek Harness: gpu_status / gpu_exec / gpu_run_bg tools, per-step GPU context injection, automatic CUDA_VISIBLE_DEVICES card selection",
   "type": "module",
   "main": "./lib/index.js",
